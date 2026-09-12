@@ -1,0 +1,31 @@
+management:
+  endpoints:
+    web:
+      exposure:
+        # Expose health, info, and Prometheus endpoints
+        include: health, info, prometheus, metrics
+  endpoint:
+    health:
+      # Show detailed health information
+      show-details: always
+      probes:
+        # Enable Kubernetes health probe endpoints
+        enabled: true
+  health:
+    # Liveness checks if the app is running
+    livenessState:
+      enabled: true
+    # Readiness checks if the app can accept traffic
+    readinessState:
+      enabled: true
+server:
+  port: 8915
+spring:
+  application:
+    name: my-modern-java-service
+    shutdown: graceful
+  lifecycle:
+    # Wait up to 30 seconds for active requests to complete
+    timeout-per-shutdown-phase: 30s
+
+

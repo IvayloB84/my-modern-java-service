@@ -1,0 +1,13 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: my-modern-java-service
+  description: Spring Boot 4 microservice (Java 21)
+  annotations:
+    github.com/project-slug: IvayloB84/my-modern-java-service
+    argocd/app-name: my-modern-java-service
+    backstage.io/kubernetes-label-selector: "app=my-modern-java-service"
+spec:
+  type: service
+  lifecycle: production
+  owner: "user:default/IvayloB84"

@@ -1,0 +1,173 @@
+# 
+name: Build and Push Container Image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # --- Fast, source-only checks. No image build required, so these run
+  # fully in parallel with build-and-push below, not stacked after it. ---
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  dockerfile-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+  sast-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/ci
+
+  iac-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Trivy config scan (Dockerfile + k8s manifests)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires a lowercase image path; github.repository preserves
+      # the repo's actual casing, so normalize it first.
+      - name: Compute lowercase image name
+        id: image
+        run: |
+          IMAGE_PATH="ghcr.io/${{ github.repository }}"
+          echo "name=$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # push:false + load:true builds the image into the local Docker
+      # daemon only — nothing reaches GHCR yet. This is what lets us scan
+      # before anything vulnerable could ever be pushed.
+      - name: Build image (local only, not pushed yet)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: '${{ steps.image.outputs.name }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      # Only reached if Trivy passed. Image already exists locally from the
+      # build step above, so this just pushes the tags already built —
+      # no rebuild.
+      - name: Push image
+        run: |
+          docker push ${{ steps.image.outputs.name }}:latest
+          docker push ${{ steps.image.outputs.name }}:${{ github.sha }}
+
+  # Writes the new immutable image tag into ArgoCD-RootApps. This commit is
+  # what ArgoCD actually reacts to — without it, ArgoCD has no way to know
+  # a new image exists, since ":latest" never changes as text.
+  update-gitops-manifest:
+    needs: [build-and-push, secret-scan, dockerfile-lint, sast-scan, iac-scan]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v7
+        with:
+          repository: IvayloB84/ArgoCD-RootApps
+          # GITHUB_TOKEN only has access to THIS repo — a cross-repo push
+          # needs a PAT with write access to ArgoCD-RootApps, stored as a
+          # secret named GITOPS_PAT on this repo (Settings > Secrets >
+          # Actions > New repository secret).
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops-repo
+
+      - name: Wait for GitOps Folder Creation
+        run: |
+          TARGET_DIR="gitops-repo/argocd-apps/${{ github.event.repository.name }}"
+          
+          counter=0
+          max_retry=40 # 40 retries * 30 seconds = 20 minutes max execution time limit
+          
+          echo "Checking if GitOps directory exists: $TARGET_DIR"
+          
+          # Loop locally using the cloned repository path to verify the folder's existence
+          until [ -d "$TARGET_DIR" ]; do
+            counter=$((counter+1))
+            if [ $counter -ge $max_retry ]; then
+              echo "Error: Timed out waiting for the GitOps folder. Has the Backstage PR been merged?"
+              exit 1
+            fi
+            
+            echo "Folder not found yet. Pulling latest Git changes and retrying in 30 seconds... ($counter/$max_retry)"
+            sleep 30
+            
+            # Fetch and pull down any changes merged to main while this runner was waiting
+            cd gitops-repo
+            git pull origin main
+            cd ..
+          done
+          
+          echo "Success! GitOps target folder detected."
+
+      - name: Bump image tag in Deployment manifest
+        run: |
+          cd gitops-repo
+          sed -i "s#image: ghcr.io/.*#image: ${{ needs.build-and-push.outputs.image }}:${{ github.sha }}#" \
+            argocd-apps/${{ github.event.repository.name }}/deployment.yaml
+
+      - name: Commit and push
+        run: |
+          cd gitops-repo
+          git config user.name "backstage-bot"
+          git config user.email "backstage-bot@users.noreply.github.com"
+          git add argocd-apps/${{ github.event.repository.name }}/deployment.yaml
+          git diff --cached --quiet && echo "No image change to commit" || \
+            git commit -m "chore(deploy): ${{ github.event.repository.name }}@${{ github.sha }}"
+          git push origin main
+# 
